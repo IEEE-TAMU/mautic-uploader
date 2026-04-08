@@ -11,11 +11,13 @@ nix-shell
 
 ## Configuration
 
-Copy the example env file and add your Mautic credentials:
+Copy the example env file and add your credentials:
 
 ```bash
 cp .env.example .env
 ```
+
+Edit `.env` with your settings:
 
 ## Usage
 
@@ -39,8 +41,8 @@ php upload.php --csv contacts.csv --dry-run
 
 Output:
 ```
-Row 2: Would create/update contact: john.doe@example.com
-Row 3: Would create/update contact: jane@example.com
+Row 1: Would create/update contact: john.doe@example.com
+Row 2: Would create/update contact: jane@example.com
 
 Done. Success: 2, Errors: 0
 ```
@@ -55,11 +57,32 @@ php upload.php --csv contacts.csv
 
 Output:
 ```
-Row 2: Success - john.doe@example.com
-Row 3: Success - jane@example.com
+Batch rows 1-2: 2 success, 0 errors
 
 Done. Success: 2, Errors: 0
 ```
+
+### Fetch from Portal
+
+Pull members directly from the member portal API:
+
+```bash
+php upload.php --portal --dry-run
+php upload.php --portal
+```
+
+This requires `PORTAL_TOKEN` in your `.env` file.
+
+The following fields are imported from the portal (preferred_name replaces firstname):
+- email
+- firstname (or preferred_name if available)
+- lastname
+- major
+- graduation_year
+- tshirt_size
+- uin
+- confirmed_at
+- member_since
 
 ## CSV Format
 
@@ -73,13 +96,16 @@ Done. Success: 2, Errors: 0
 
 ## Options
 
-- `--csv <file>` - Path to CSV file (required)
+- `--csv <file>` - Path to CSV file (required if not using --portal)
+- `--portal` - Fetch members from member portal API instead of CSV
+- `--portal-url <url>` - Portal API URL (default: https://portal.ieeetamu.org)
 - `--dry-run` - Preview without making changes
 - `--help` - Show usage information
 
 ## Behavior
 
 - Creates new contacts if email doesn't exist
-- Updates existing contacts if email already exists
-- Reports success/error for each row
+- Updates existing contacts if email already exists (Mautic auto-merges by email)
+- Contacts are uploaded in batches of 100 for fast processing
+- Each batch prints a progress line with success/error counts
 - Exit code 0 on success, 1 if any errors

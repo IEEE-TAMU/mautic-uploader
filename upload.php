@@ -2,27 +2,26 @@
 
 require __DIR__ . '/vendor/autoload.php';
 
-use Dotenv\Dotenv;
 use GuzzleHttp\Client;
 use Mautic\Auth\ApiAuth;
 use Mautic\MauticApi;
 
-$dotenv = Dotenv::createImmutable(__DIR__);
-$dotenv->load();
-
-$options = getopt('', ['csv:', 'dry-run', 'help']);
+$options = getopt('', ['csv:', 'portal', 'portal-url:', 'dry-run', 'help']);
 $csvPath = $options['csv'] ?? null;
+$usePortal = isset($options['portal']);
+$portalUrl = $options['portal-url'] ?? $_ENV['PORTAL_URL'] ?? 'https://portal.ieeetamu.org';
 $dryRun = isset($options['dry-run']);
 
-if (isset($options['help']) || !$csvPath) {
-    echo "Usage: php upload.php --csv <file.csv> [--dry-run]\n";
-    echo "\nCSV should have 'email' column (required), plus optional columns like firstname, lastname, company\n";
+if (isset($options['help'])) {
+    echo "Usage: php upload.php [OPTIONS]\n";
+    echo "\nOptions:\n";
+    echo "  --csv <file>         CSV file to import (required if not using --portal)\n";
+    echo "  --portal             Fetch members from member portal API\n";
+    echo "  --portal-url <url>   Portal API URL (default: https://portal.ieeetamu.org)\n";
+    echo "  --dry-run            Preview without making changes\n";
+    echo "  --help               Show this help\n";
+    echo "\nCSV format: email column required, others optional (firstname, lastname, company, etc)\n";
     exit(0);
-}
-
-if (!file_exists($csvPath)) {
-    fwrite(STDERR, "Error: CSV file not found: $csvPath\n");
-    exit(1);
 }
 
 $config = [
@@ -32,7 +31,7 @@ $config = [
 ];
 
 if (!$config['baseUrl'] || !$config['userName'] || !$config['password']) {
-    fwrite(STDERR, "Error: Missing required environment variables. Check .env file.\n");
+    fwrite(STDERR, "Error: Missing Mautic config. Check .env file.\n");
     exit(1);
 }
 
@@ -46,67 +45,206 @@ $auth = $initAuth->newAuth($config, 'BasicAuth');
 $api = new MauticApi();
 $contactApi = $api->newApi('contacts', $auth, $config['baseUrl']);
 
-$csv = fopen($csvPath, 'r');
-$headers = fgetcsv($csv);
-$headers = array_map('strtolower', $headers);
-
-if (!in_array('email', $headers)) {
-    fwrite(STDERR, "Error: CSV must have an 'email' column\n");
-    exit(1);
-}
-
-$emailIdx = array_search('email', $headers);
-$rowNum = 1;
-$successCount = 0;
-$errorCount = 0;
-
-while (($row = fgetcsv($csv)) !== false) {
-    $rowNum++;
-    $data = [];
-    foreach ($headers as $i => $header) {
-        if ($header !== 'email' && isset($row[$i]) && $row[$i] !== '') {
-            $data[$header] = $row[$i];
-        }
-    }
-
-    $email = $row[$emailIdx] ?? '';
-    if (empty($email) || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
-        echo "Row $rowNum: Skipping invalid email: $email\n";
-        $errorCount++;
-        continue;
-    }
-
-    $data['email'] = $email;
-
+function uploadBatch($contactApi, $batch, $dryRun, $startRow) {
     if ($dryRun) {
-        echo "Row $rowNum: Would create/update contact: $email\n";
-        $successCount++;
-        continue;
+        foreach ($batch as $i => $contact) {
+            $rowNum = $startRow + $i;
+            echo "Row $rowNum: Would create/update contact: " . ($contact['email'] ?? 'unknown') . "\n";
+            if (!empty($contact['tags'])) {
+                echo "Row $rowNum:   Tags: " . implode(', ', $contact['tags']) . "\n";
+            }
+        }
+        return ['success' => count($batch), 'errors' => 0, 'dryRun' => true];
     }
 
     try {
-        $existing = $contactApi->getList('email:' . $email, 0, 1);
-        if (!empty($existing['contacts'])) {
-            $existingId = array_keys($existing['contacts'])[0];
-            $response = $contactApi->edit($existingId, $data);
-        } else {
-            $response = $contactApi->create($data);
-        }
+        $response = $contactApi->createBatch($batch);
+
+        $successCount = 0;
+        $errorCount = 0;
 
         if (isset($response['errors'])) {
-            echo "Row $rowNum: Error for $email: " . $response['errors'][0]['message'] . "\n";
-            $errorCount++;
-        } else {
-            echo "Row $rowNum: Success - $email\n";
-            $successCount++;
+            return ['success' => 0, 'errors' => count($response['errors']), 'details' => $response['errors']];
         }
+
+        if (!empty($response['contacts'])) {
+            foreach ($response['contacts'] as $contact) {
+                if (isset($contact['errors'])) {
+                    $errorCount++;
+                } else {
+                    $successCount++;
+                }
+            }
+        }
+
+        return ['success' => $successCount, 'errors' => $errorCount];
     } catch (Exception $e) {
-        echo "Row $rowNum: Exception for $email: " . $e->getMessage() . "\n";
-        $errorCount++;
+        return ['success' => 0, 'errors' => 1, 'details' => [$e->getMessage()]];
     }
 }
 
-fclose($csv);
+function processBatch($contactApi, &$contactBatch, $dryRun, $batchStartRow, &$successCount, &$errorCount) {
+    if (empty($contactBatch)) {
+        return;
+    }
+
+    $result = uploadBatch($contactApi, $contactBatch, $dryRun, $batchStartRow);
+    $successCount += $result['success'];
+    $errorCount += $result['errors'];
+
+    if (!$dryRun) {
+        echo "Batch rows $batchStartRow-" . ($batchStartRow + count($contactBatch) - 1) . ": " . $result['success'] . " success, " . $result['errors'] . " errors\n";
+    }
+
+    if (!empty($result['details'])) {
+        foreach ($result['details'] as $err) {
+            $msg = is_array($err) ? ($err['message'] ?? 'Unknown error') : $err;
+            echo "Batch error: $msg\n";
+        }
+    }
+
+    $contactBatch = [];
+}
+
+function transformMemberToContact($member) {
+    $data = [];
+    $data['email'] = $member['email'];
+
+    if (isset($member['info'])) {
+        $info = $member['info'];
+        if (!empty($info['preferred_name'])) {
+            $data['firstname'] = $info['preferred_name'];
+        } elseif (!empty($info['first_name'])) {
+            $data['firstname'] = $info['first_name'];
+        }
+        if (!empty($info['last_name'])) $data['lastname'] = $info['last_name'];
+        if (!empty($info['major'])) $data['major'] = $info['major'];
+        if (!empty($info['graduation_year'])) $data['graduation_year'] = (string)$info['graduation_year'];
+        if (!empty($info['tshirt_size'])) $data['tshirt_size'] = $info['tshirt_size'];
+        if (!empty($info['uin'])) $data['uin'] = (string)$info['uin'];
+    }
+
+    if (!empty($member['confirmed_at'])) $data['confirmed_at'] = $member['confirmed_at'];
+    if (!empty($member['inserted_at'])) $data['member_since'] = $member['inserted_at'];
+
+    return $data;
+}
+
+$successCount = 0;
+$errorCount = 0;
+
+if ($usePortal) {
+    $portalToken = $_ENV['PORTAL_TOKEN'] ?? null;
+    if (!$portalToken) {
+        fwrite(STDERR, "Error: PORTAL_TOKEN not set. Check .env file.\n");
+        exit(1);
+    }
+
+    echo "Fetching members from portal: $portalUrl\n";
+
+    try {
+        $response = $httpClient->request('GET', $portalUrl . '/api/v1/members', [
+            'headers' => [
+                'Authorization' => 'Bearer ' . $portalToken,
+                'Accept' => 'application/json',
+            ],
+        ]);
+
+        $members = json_decode($response->getBody(), true);
+
+        if (!is_array($members)) {
+            fwrite(STDERR, "Error: Invalid response from portal\n");
+            exit(1);
+        }
+
+        echo "Found " . count($members) . " members\n\n";
+
+        $batchSize = 100;
+        $contactBatch = [];
+        $batchStartRow = 1;
+        $rowNum = 1;
+
+        foreach ($members as $member) {
+            $rowNum++;
+            $email = $member['email'] ?? '';
+
+            if (empty($email) || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
+                echo "Row $rowNum: Skipping invalid email: $email\n";
+                $errorCount++;
+                continue;
+            }
+
+            $data = transformMemberToContact($member);
+            $data['tags'] = ['portal-upload'];
+            $contactBatch[] = $data;
+
+            if (count($contactBatch) >= $batchSize) {
+                processBatch($contactApi, $contactBatch, $dryRun, $batchStartRow, $successCount, $errorCount);
+                $batchStartRow = $rowNum + 1;
+            }
+        }
+
+        processBatch($contactApi, $contactBatch, $dryRun, $batchStartRow, $successCount, $errorCount);
+    } catch (Exception $e) {
+        fwrite(STDERR, "Error fetching from portal: " . $e->getMessage() . "\n");
+        exit(1);
+    }
+} else {
+    if (!$csvPath) {
+        fwrite(STDERR, "Error: --csv or --portal required. Use --help for usage.\n");
+        exit(1);
+    }
+
+    if (!file_exists($csvPath)) {
+        fwrite(STDERR, "Error: CSV file not found: $csvPath\n");
+        exit(1);
+    }
+
+    $csv = fopen($csvPath, 'r');
+    $headers = fgetcsv($csv);
+    $headers = array_map('strtolower', $headers);
+
+    if (!in_array('email', $headers)) {
+        fwrite(STDERR, "Error: CSV must have an 'email' column\n");
+        exit(1);
+    }
+
+    $emailIdx = array_search('email', $headers);
+    $batchSize = 100;
+    $contactBatch = [];
+    $batchStartRow = 1;
+    $rowNum = 1;
+
+    while (($row = fgetcsv($csv)) !== false) {
+        $rowNum++;
+        $data = [];
+        foreach ($headers as $i => $header) {
+            if ($header !== 'email' && isset($row[$i]) && $row[$i] !== '') {
+                $data[$header] = $row[$i];
+            }
+        }
+
+        $email = $row[$emailIdx] ?? '';
+        if (empty($email) || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
+            echo "Row $rowNum: Skipping invalid email: $email\n";
+            $errorCount++;
+            continue;
+        }
+
+        $data['email'] = $email;
+        $data['tags'] = ['manual-upload'];
+        $contactBatch[] = $data;
+
+        if (count($contactBatch) >= $batchSize) {
+            processBatch($contactApi, $contactBatch, $dryRun, $batchStartRow, $successCount, $errorCount);
+            $batchStartRow = $rowNum + 1;
+        }
+    }
+
+    processBatch($contactApi, $contactBatch, $dryRun, $batchStartRow, $successCount, $errorCount);
+
+    fclose($csv);
+}
 
 echo "\nDone. Success: $successCount, Errors: $errorCount\n";
 exit($errorCount > 0 ? 1 : 0);
