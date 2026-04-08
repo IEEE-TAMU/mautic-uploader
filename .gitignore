@@ -1,0 +1,11 @@
+/vendor/
+.composer/
+
+.env
+*.csv
+!sample.csv
+
+.direnv/
+result
+result-*
+
