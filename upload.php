@@ -3,14 +3,16 @@
 require __DIR__ . '/vendor/autoload.php';
 
 use GuzzleHttp\Client;
+use GuzzleHttp\HandlerStack;
 use Mautic\Auth\ApiAuth;
 use Mautic\MauticApi;
 
-$options = getopt('', ['csv:', 'portal', 'portal-url:', 'dry-run', 'help']);
+$options = getopt('v', ['csv:', 'portal', 'portal-url:', 'dry-run', 'help', 'verbose']);
 $csvPath = $options['csv'] ?? null;
 $usePortal = isset($options['portal']);
 $portalUrl = $options['portal-url'] ?? $_ENV['PORTAL_URL'] ?? 'https://portal.ieeetamu.org';
 $dryRun = isset($options['dry-run']);
+$verbose = isset($options['verbose']) || isset($options['v']);
 
 if (isset($options['help'])) {
     echo "Usage: php upload.php [OPTIONS]\n";
@@ -19,6 +21,7 @@ if (isset($options['help'])) {
     echo "  --portal             Fetch members from member portal API\n";
     echo "  --portal-url <url>   Portal API URL (default: https://portal.ieeetamu.org)\n";
     echo "  --dry-run            Preview without making changes\n";
+    echo "  --verbose, -v        Log full request details (endpoint, headers, body)\n";
     echo "  --help               Show this help\n";
     echo "\nCSV format: email column required, others optional (firstname, lastname, company, etc)\n";
     exit(0);
@@ -35,7 +38,27 @@ if (!$config['baseUrl'] || !$config['userName'] || !$config['password']) {
     exit(1);
 }
 
+$stack = HandlerStack::create();
+if ($verbose) {
+    $stack->push(function (callable $handler) {
+        return function ($request, $options) use ($handler) {
+            echo "\n=== GATEWAY REQUEST ===\n";
+            echo $request->getMethod() . ' ' . $request->getUri() . "\n";
+            foreach ($request->getHeaders() as $name => $values) {
+                echo "$name: " . implode(', ', $values) . "\n";
+            }
+            $body = (string) $request->getBody();
+            if ($body) {
+                $preview = strlen($body) > 500 ? substr($body, 0, 500) . '...' : $body;
+                echo "\n" . $preview . "\n";
+            }
+            echo "=======================\n\n";
+            return $handler($request, $options);
+        };
+    });
+}
 $httpClient = new Client([
+    'handler' => $stack,
     'timeout' => 30,
 ]);
 
@@ -46,6 +69,7 @@ $api = new MauticApi();
 $contactApi = $api->newApi('contacts', $auth, $config['baseUrl']);
 
 function uploadBatch($contactApi, $batch, $dryRun, $startRow) {
+    global $verbose;
     if ($dryRun) {
         foreach ($batch as $i => $contact) {
             $rowNum = $startRow + $i;
@@ -58,6 +82,21 @@ function uploadBatch($contactApi, $batch, $dryRun, $startRow) {
     }
 
     try {
+        if ($verbose) {
+            $mauticUrl = $_ENV['MAUTIC_BASE_URL'] . '/api/contacts/batch/new';
+            $authHeader = 'Basic ' . base64_encode($_ENV['MAUTIC_USERNAME'] . ':' . $_ENV['MAUTIC_PASSWORD']);
+            $body = json_encode($batch, JSON_UNESCAPED_SLASHES);
+            $preview = strlen($body) > 500 ? substr($body, 0, 500) . '...' : $body;
+
+            echo "\n=== MAUTIC REQUEST ===\n";
+            echo "POST $mauticUrl\n";
+            echo "Authorization: $authHeader\n";
+            echo "Content-Type: application/json\n";
+            echo "Accept: application/json\n";
+            echo "\n$preview\n";
+            echo "======================\n\n";
+        }
+
         $response = $contactApi->createBatch($batch);
 
         $successCount = 0;
